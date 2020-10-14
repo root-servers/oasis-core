@@ -1054,6 +1054,7 @@ func generateStorageReceiptSignature(t *testing.T, blk *block.Block, body *Compu
 		Version:   1,
 		Namespace: blk.Header.Namespace,
 		Round:     blk.Header.Round,
+		RootTypes: body.RootTypesForStorageReceipt(),
 		Roots:     body.RootsForStorageReceipt(),
 	}
 	signed, err := signature.SignSigned(sk, storage.ReceiptSignatureContext, &receiptBody)
