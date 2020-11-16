@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"time"
 
@@ -13,7 +12,6 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
-	"github.com/oasisprotocol/oasis-core/go/common/prettyprint"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 	"github.com/oasisprotocol/oasis-core/go/common/sgx"
 	"github.com/oasisprotocol/oasis-core/go/common/version"
@@ -27,7 +25,9 @@ var (
 	// kind is malformed or unknown.
 	ErrUnsupportedRuntimeKind = errors.New("runtime: unsupported runtime kind")
 
-	_ prettyprint.PrettyPrinter = (*SignedRuntime)(nil)
+	// ErrUnsupportedRuntimeGovernanceModel is the error returned when the
+	// parsed runtime governance model is malformed or unknown.
+	ErrUnsupportedRuntimeGovernanceModel = errors.New("runtime: unsupported governance model")
 )
 
 // RuntimeKind represents the runtime functionality.
@@ -96,10 +96,13 @@ type ExecutorParameters struct {
 	// MaxMessages is the maximum number of messages that can be emitted by the runtime in a
 	// single round.
 	MaxMessages uint32 `json:"max_messages"`
+
+	// MinPoolSize is the minimum required candidate compute node pool size.
+	MinPoolSize uint64 `json:"min_pool_size"`
 }
 
 // ValidateBasic performs basic executor parameter validity checks.
-func (e *ExecutorParameters) ValidateBasic() error {
+func (e *ExecutorParameters) ValidateBasic(version uint16) error {
 	if e.GroupSize == 0 {
 		return fmt.Errorf("executor primary group too small")
 	}
@@ -110,6 +113,11 @@ func (e *ExecutorParameters) ValidateBasic() error {
 	if e.RoundTimeout < 5 {
 		return fmt.Errorf("round timeout too small")
 	}
+
+	if version > 1 && e.MinPoolSize < e.GroupSize+e.GroupBackupSize {
+		return fmt.Errorf("minimum pool size too small")
+	}
+
 	return nil
 }
 
@@ -179,10 +187,13 @@ type StorageParameters struct {
 
 	// CheckpointChunkSize is the chunk size parameter for checkpoint creation.
 	CheckpointChunkSize uint64 `json:"checkpoint_chunk_size"`
+
+	// MinPoolSize is the minimum required candidate storage node pool size.
+	MinPoolSize uint64 `json:"min_pool_size"`
 }
 
 // ValidateBasic performs basic storage parameter validity checks.
-func (s *StorageParameters) ValidateBasic() error {
+func (s *StorageParameters) ValidateBasic(version uint16) error {
 	// Ensure there is at least one member of the storage group.
 	if s.GroupSize == 0 {
 		return fmt.Errorf("storage group too small")
@@ -214,6 +225,11 @@ func (s *StorageParameters) ValidateBasic() error {
 			return fmt.Errorf("storage CheckpointChunkSize parameter too small")
 		}
 	}
+
+	if version > 1 && s.MinPoolSize < s.GroupSize {
+		return fmt.Errorf("minimum pool size too small")
+	}
+
 	return nil
 }
 
@@ -222,7 +238,16 @@ type AnyNodeRuntimeAdmissionPolicy struct{}
 
 // EntityWhitelistRuntimeAdmissionPolicy allows only whitelisted entities' nodes to register.
 type EntityWhitelistRuntimeAdmissionPolicy struct {
-	Entities map[signature.PublicKey]bool `json:"entities"`
+	Entities map[signature.PublicKey]EntityWhitelistConfig `json:"entities"`
+}
+
+type EntityWhitelistConfig struct {
+	// MaxNodes is the maximum number of nodes that an entity can register under
+	// the given runtime for a specific role. If the map is empty or absent, the
+	// number of nodes is unlimited. If the map is present and non-empty, the
+	// the number of nodes is restricted to the specified maximum (where zero
+	// means no nodes allowed), any missing roles imply zero nodes.
+	MaxNodes map[node.RolesMask]uint16 `json:"max_nodes,omitempty"`
 }
 
 // RuntimeAdmissionPolicy is a specification of which nodes are allowed to register for a runtime.
@@ -267,7 +292,7 @@ func (s *RuntimeStakingParameters) ValidateBasic(runtimeKind RuntimeKind) error 
 const (
 	// LatestRuntimeDescriptorVersion is the latest entity descriptor version that should be used
 	// for all new descriptors. Using earlier versions may be rejected.
-	LatestRuntimeDescriptorVersion = 1
+	LatestRuntimeDescriptorVersion = 2
 
 	// Minimum and maximum descriptor versions that are allowed.
 	minRuntimeDescriptorVersion = 1
@@ -316,6 +341,61 @@ type Runtime struct { // nolint: maligned
 
 	// Staking stores the runtime's staking-related parameters.
 	Staking RuntimeStakingParameters `json:"staking,omitempty"`
+
+	// GovernanceModel specifies the runtime governance model.
+	GovernanceModel RuntimeGovernanceModel `json:"governance_model"`
+}
+
+// RuntimeGovernanceModel specifies the runtime governance model.
+type RuntimeGovernanceModel uint8
+
+const (
+	GovernanceInvalid   RuntimeGovernanceModel = 0
+	GovernanceEntity    RuntimeGovernanceModel = 1
+	GovernanceRuntime   RuntimeGovernanceModel = 2
+	GovernanceConsensus RuntimeGovernanceModel = 3
+
+	GovernanceMax = GovernanceConsensus
+
+	gmInvalid   = "invalid"
+	gmEntity    = "entity"
+	gmRuntime   = "runtime"
+	gmConsensus = "consensus"
+)
+
+// String returns a string representation of a runtime governance model.
+func (gm RuntimeGovernanceModel) String() string {
+	switch gm {
+	case GovernanceInvalid:
+		return gmInvalid
+	case GovernanceEntity:
+		return gmEntity
+	case GovernanceRuntime:
+		return gmRuntime
+	case GovernanceConsensus:
+		return gmConsensus
+	default:
+		return "[unsupported runtime governance model]"
+	}
+}
+
+func (gm *RuntimeGovernanceModel) MarshalText() ([]byte, error) {
+	return []byte(gm.String()), nil
+}
+
+func (gm *RuntimeGovernanceModel) UnmarshalText(text []byte) error {
+	switch string(text) {
+	case gmEntity:
+		*gm = GovernanceEntity
+	case gmRuntime:
+		*gm = GovernanceRuntime
+	case gmConsensus:
+		*gm = GovernanceConsensus
+	default:
+		return ErrUnsupportedRuntimeGovernanceModel
+	}
+
+	return nil
 }
 
 // ValidateBasic performs basic descriptor validity checks.
@@ -350,13 +430,13 @@ func (r *Runtime) ValidateBasic(strictVersion bool) error {
 			return fmt.Errorf("compute runtime has self as key manager")
 		}
 
-		if err := r.Executor.ValidateBasic(); err != nil {
+		if err := r.Executor.ValidateBasic(v); err != nil {
 			return fmt.Errorf("bad executor parameters: %w", err)
 		}
 		if err := r.TxnScheduler.ValidateBasic(); err != nil {
 			return fmt.Errorf("bad txn scheduler parameters: %w", err)
 		}
-		if err := r.Storage.ValidateBasic(); err != nil {
+		if err := r.Storage.ValidateBasic(v); err != nil {
 			return fmt.Errorf("bad storage parameters: %w", err)
 		}
 	case KindKeyManager:
@@ -380,6 +460,11 @@ func (r *Runtime) ValidateBasic(strictVersion bool) error {
 	if err := r.Staking.ValidateBasic(r.Kind); err != nil {
 		return fmt.Errorf("bad staking parameters: %w", err)
 	}
+
+	if v > 1 && (r.GovernanceModel < 1 || r.GovernanceModel > GovernanceMax) {
+		return ErrUnsupportedRuntimeGovernanceModel
+	}
+
 	return nil
 }
 
@@ -391,49 +476,6 @@ func (r Runtime) String() string {
 // IsCompute returns true iff the runtime is a generic compute runtime.
 func (r *Runtime) IsCompute() bool {
 	return r.Kind == KindCompute
-}
-
-// SignedRuntime is a signed blob containing a CBOR-serialized Runtime.
-type SignedRuntime struct {
-	signature.Signed
-}
-
-// Open first verifies the blob signature and then unmarshals the blob.
-func (s *SignedRuntime) Open(context signature.Context, runtime *Runtime) error { // nolint: interfacer
-	return s.Signed.Open(context, runtime)
-}
-
-// PrettyPrint writes a pretty-printed representation of the type
-// to the given writer.
-func (s SignedRuntime) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
-	pt, err := s.PrettyType()
-	if err != nil {
-		fmt.Fprintf(w, "%s<error: %s>\n", prefix, err)
-		return
-	}
-
-	pt.(prettyprint.PrettyPrinter).PrettyPrint(ctx, prefix, w)
-}
-
-// PrettyType returns a representation of the type that can be used for pretty printing.
-func (s SignedRuntime) PrettyType() (interface{}, error) {
-	var rt Runtime
-	if err := cbor.Unmarshal(s.Signed.Blob, &rt); err != nil {
-		return nil, fmt.Errorf("malformed signed blob: %w", err)
-	}
-	return signature.NewPrettySigned(s.Signed, rt)
-}
-
-// SignRuntime serializes the Runtime and signs the result.
-func SignRuntime(signer signature.Signer, context signature.Context, runtime *Runtime) (*SignedRuntime, error) {
-	signed, err := signature.SignSigned(signer, context, runtime)
-	if err != nil {
-		return nil, err
-	}
-
-	return &SignedRuntime{
-		Signed: *signed,
-	}, nil
 }
 
 // VersionInfo is the per-runtime version information.

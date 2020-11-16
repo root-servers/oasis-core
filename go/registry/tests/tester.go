@@ -568,8 +568,8 @@ func testRegistryRuntime(t *testing.T, backend api.Backend, consensus consensusA
 				require.NoError(err, "NewTestEntities with entity node seed")
 				rt.AdmissionPolicy = api.RuntimeAdmissionPolicy{
 					EntityWhitelist: &api.EntityWhitelistRuntimeAdmissionPolicy{
-						Entities: map[signature.PublicKey]bool{
-							nodeEntities[1].Entity.ID: true,
+						Entities: map[signature.PublicKey]api.EntityWhitelistConfig{
+							nodeEntities[1].Entity.ID: {MaxNodes: nil},
 						},
 					},
 				}
@@ -1373,10 +1373,7 @@ func (rt *TestRuntime) MustRegister(t *testing.T, backend api.Backend, consensus
 	require.NoError(err, "WatchRuntimes")
 	defer sub.Close()
 
-	signed, err := signature.SignSigned(rt.Signer, api.RegisterRuntimeSignatureContext, rt.Runtime)
-	require.NoError(err, "signed runtime descriptor")
-
-	tx := api.NewRegisterRuntimeTx(0, nil, &api.SignedRuntime{Signed: *signed})
+	tx := api.NewRegisterRuntimeTx(0, nil, rt.Runtime)
 	err = consensusAPI.SignAndSubmitTx(context.Background(), consensus, rt.Signer, tx)
 	require.NoError(err, "RegisterRuntime")
 
@@ -1424,11 +1421,8 @@ func (rt *TestRuntime) MustRegister(t *testing.T, backend api.Backend, consensus
 func (rt *TestRuntime) MustNotRegister(t *testing.T, backend api.Backend, consensus consensusAPI.Backend) {
 	require := require.New(t)
 
-	signed, err := signature.SignSigned(rt.Signer, api.RegisterRuntimeSignatureContext, rt.Runtime)
-	require.NoError(err, "signed runtime descriptor")
-
-	tx := api.NewRegisterRuntimeTx(0, nil, &api.SignedRuntime{Signed: *signed})
-	err = consensusAPI.SignAndSubmitTx(context.Background(), consensus, rt.Signer, tx)
+	tx := api.NewRegisterRuntimeTx(0, nil, rt.Runtime)
+	err := consensusAPI.SignAndSubmitTx(context.Background(), consensus, rt.Signer, tx)
 	require.Error(err, "RegisterRuntime failure")
 }
 
@@ -1622,6 +1616,7 @@ func NewTestRuntime(seed []byte, ent *TestEntity, isKeyManager bool) (*TestRunti
 			AllowedStragglers: 1,
 			RoundTimeout:      10,
 			MaxMessages:       32,
+			MinPoolSize:       8, // GroupSize + GroupBackupSize
 		},
 		TxnScheduler: api.TxnSchedulerParameters{
 			Algorithm:         api.TxnSchedulerSimple,
@@ -1635,10 +1630,12 @@ func NewTestRuntime(seed []byte, ent *TestEntity, isKeyManager bool) (*TestRunti
 			MinWriteReplication:     3,
 			MaxApplyWriteLogEntries: 100_000,
 			MaxApplyOps:             2,
+			MinPoolSize:             3,
 		},
 		AdmissionPolicy: api.RuntimeAdmissionPolicy{
 			AnyNode: &api.AnyNodeRuntimeAdmissionPolicy{},
 		},
+		GovernanceModel: api.GovernanceEntity,
 	}
 	// TODO: Test with non-empty state root when enabled.
 	rt.Runtime.Genesis.StateRoot.Empty()

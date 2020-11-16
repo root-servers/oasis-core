@@ -241,12 +241,73 @@ func (app *registryApplication) registerNode( // nolint: gocyclo
 
 	// Check runtime's whitelist.
 	for _, rt := range paidRuntimes {
-		if rt.AdmissionPolicy.EntityWhitelist != nil && !rt.AdmissionPolicy.EntityWhitelist.Entities[newNode.EntityID] {
+		if rt.AdmissionPolicy.EntityWhitelist == nil {
+			continue
+		}
+		wcfg, entIsWhitelisted := rt.AdmissionPolicy.EntityWhitelist.Entities[newNode.EntityID]
+		if !entIsWhitelisted {
 			ctx.Logger().Error("RegisterNode: node's entity not in a runtime's whitelist",
 				"entity", newNode.EntityID,
 				"runtime", rt.ID,
 			)
 			return registry.ErrForbidden
+		}
+		if wcfg.MaxNodes == nil {
+			continue
+		}
+		if len(wcfg.MaxNodes) == 0 {
+			continue
+		}
+
+		// Map is present and non-empty, check per-role restrictions
+		// on the maximum number of nodes per entity.
+
+		// Iterate over all valid roles (each entry in the map can
+		// only have a single role).
+		for _, role := range node.Roles() {
+			if !newNode.HasRoles(role) {
+				// Skip unset roles.
+				continue
+			}
+
+			maxNodes, exists := wcfg.MaxNodes[role]
+			if !exists {
+				// No such role found in whitelist.
+				return registry.ErrForbidden
+			}
+			if maxNodes == 0 {
+				// No nodes of this type are allowed.
+				return registry.ErrForbidden
+			}
+
+			// Count existing nodes owned by entity.
+			nodes, grr := state.GetEntityNodes(ctx, newNode.EntityID)
+			if grr != nil {
+				ctx.Logger().Error("RegisterNode: failed to query entity nodes",
+					"err", grr,
+					"entity", newNode.EntityID,
+				)
+				return grr
+			}
+			var curNodes uint16
+			for _, n := range nodes {
+				if n.IsExpired(uint64(epoch)) || n.GetRuntime(rt.ID) == nil {
+					// Skip expired nodes and nodes that haven't registered
+					// for the same runtime.
+					continue
+				}
+
+				if n.HasRoles(role) {
+					curNodes++
+				}
+
+				// The check is inside the for loop, so we can stop as
+				// soon as possible once we're over the limit.
+				if curNodes > maxNodes {
+					// Too many nodes with given role already registered.
+					return registry.ErrForbidden
+				}
+			}
 		}
 	}
 
@@ -504,7 +565,7 @@ func (app *registryApplication) unfreezeNode(
 func (app *registryApplication) registerRuntime( // nolint: gocyclo
 	ctx *api.Context,
 	state *registryState.MutableState,
-	sigRt *registry.SignedRuntime,
+	rt *registry.Runtime,
 ) error {
 	params, err := state.ConsensusParameters(ctx)
 	if err != nil {
@@ -518,8 +579,7 @@ func (app *registryApplication) registerRuntime( // nolint: gocyclo
 		return registry.ErrForbidden
 	}
 
-	rt, err := registry.VerifyRegisterRuntimeArgs(params, ctx.Logger(), sigRt, ctx.IsInitChain(), false)
-	if err != nil {
+	if err = registry.VerifyRuntime(params, ctx.Logger(), rt, ctx.IsInitChain(), false); err != nil {
 		return err
 	}
 
@@ -542,11 +602,17 @@ func (app *registryApplication) registerRuntime( // nolint: gocyclo
 		return err
 	}
 
-	// Make sure the signer of the transaction matches the signer of the runtime.
+	// Make sure the signer of the transaction matches the signer of the
+	// entity that is controlling the runtime.
 	// NOTE: If this is invoked during InitChain then there is no actual transaction
 	//       and thus no transaction signer so we must skip this check.
-	if !ctx.IsInitChain() && !sigRt.Signature.PublicKey.Equal(ctx.TxSigner()) {
+	if !ctx.IsInitChain() && !rt.EntityID.Equal(ctx.TxSigner()) {
 		return registry.ErrIncorrectTxSigner
+	}
+
+	// Consensus-layer governance runtimes can only be registered during genesis.
+	if !ctx.IsInitChain() && rt.GovernanceModel == registry.GovernanceConsensus {
+		return registry.ErrForbidden
 	}
 
 	// Make sure the runtime doesn't exist yet.
@@ -573,16 +639,33 @@ func (app *registryApplication) registerRuntime( // nolint: gocyclo
 		if err != nil {
 			return err
 		}
+		// If the governance model is runtime-defined governance, the owner
+		// cannot perform any updates after the initial registration.
+		// Updates to such runtimes should be done via runtime messages.
+		if existingRt.GovernanceModel == registry.GovernanceRuntime {
+			return registry.ErrForbidden
+		}
 	}
 
-	// Make sure that the entity has enough stake.
-	if !params.DebugBypassStake {
+	// Make sure that the entity or runtime has enough stake.
+	// Runtimes using the consensus layer governance model do not require stake.
+	if !params.DebugBypassStake && rt.GovernanceModel != registry.GovernanceConsensus {
 		claim := registry.StakeClaimForRuntime(rt.ID)
 		thresholds := registry.StakeThresholdsForRuntime(rt)
-		acctAddr := staking.NewAddress(rt.EntityID)
+		var acctAddr staking.Address
+		switch rt.GovernanceModel {
+		case registry.GovernanceEntity:
+			acctAddr = staking.NewAddress(rt.EntityID)
+		case registry.GovernanceRuntime:
+			acctAddr = ctx.CallerAddress()
+		default:
+			// Basic validation should have caught this, but just in case...
+			ctx.Logger().Error("RegisterRuntime: invalid governance model")
+			return registry.ErrInvalidArgument
+		}
 
 		if err = stakingState.AddStakeClaim(ctx, acctAddr, claim, thresholds); err != nil {
-			ctx.Logger().Error("RegisterRuntime: Insufficient stake",
+			ctx.Logger().Error("RegisterRuntime: insufficient stake",
 				"err", err,
 				"entity", rt.EntityID,
 				"account", acctAddr,
@@ -608,7 +691,7 @@ func (app *registryApplication) registerRuntime( // nolint: gocyclo
 		return err
 	}
 
-	if err = state.SetRuntime(ctx, rt, sigRt, suspended); err != nil {
+	if err = state.SetRuntime(ctx, rt, suspended); err != nil {
 		ctx.Logger().Error("RegisterRuntime: failed to create runtime",
 			"err", err,
 			"runtime", rt,
